@@ -1,0 +1,71 @@
+# Integration test for Engineering CI: runs the unchanged engineering-ci.yml (copied from
+# GeoRobert630/vibe-code-engineering tools/engineering-ci/examples/github-actions-engineering-ci.yml) once per case
+# directory and asserts the combined result. enforce: false keeps FAIL cases from failing their own call so this
+# run reports only whether every case produced its EXPECTED result.
+#
+#   case   project             security gate   quality gate   overall
+#   A      cases/a-clean       PASS            PASS           PASS
+#   B      cases/b-security    FAIL            PASS           FAIL   (existing intentional Phase 2 SQL-injection fixture)
+#   C      cases/c-quality     PASS            FAIL           FAIL   (existing inaccessible Quality CI fixture)
+#   D      cases/d-both        FAIL            FAIL           FAIL
+#
+# Every case: no runtime target, so Authentication / Session / Authorization must be NOT VERIFIED.
+# No credentials or secrets are used.
+name: engineering-ci-cases
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  case-a:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/a-clean, quality_site_dir: site, artifact_suffix: -case-a, enforce: false}
+  case-b:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/b-security, quality_site_dir: site, artifact_suffix: -case-b, enforce: false}
+  case-c:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/c-quality, quality_site_dir: site, artifact_suffix: -case-c, enforce: false}
+  case-d:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/d-both, quality_site_dir: site, artifact_suffix: -case-d, enforce: false}
+
+  assert:
+    name: Assert expected results
+    needs: [case-a, case-b, case-c, case-d]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare with expectations
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["RESULTS"])
+          expected = {
+              "case-a": ("PASS", "PASS", "PASS"),
+              "case-b": ("FAIL", "PASS", "FAIL"),
+              "case-c": ("PASS", "FAIL", "FAIL"),
+              "case-d": ("FAIL", "FAIL", "FAIL"),
+          }
+          bad = 0
+          print("| case | security | quality | overall | auth / session / authz | expected | ok |")
+          print("|---|---|---|---|---|---|---|")
+          for case, (sec, qual, overall) in expected.items():
+              o = needs.get(case, {}).get("outputs", {})
+              got = (o.get("security_status"), o.get("quality_status"), o.get("overall"))
+              gates = (o.get("security_gate"), o.get("quality_gate"))
+              cov = (o.get("authentication"), o.get("session"), o.get("authorization"))
+              ok = got == (sec, qual, overall) and gates == (sec, qual) and cov == ("NOT VERIFIED",) * 3
+              bad += not ok
+              print(f"| {case} | {got[0]} | {got[1]} | {got[2]} | {' / '.join(map(str, cov))} | {sec}/{qual}/{overall} | {'yes' if ok else 'NO'} |")
+          sys.exit(1 if bad else 0)
+          PY
