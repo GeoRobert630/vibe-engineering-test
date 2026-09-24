@@ -1,13 +1,17 @@
-# Integration test for Engineering CI: runs the unchanged engineering-ci.yml (copied from
-# GeoRobert630/vibe-code-engineering tools/engineering-ci/examples/github-actions-engineering-ci.yml) once per case
-# directory and asserts the combined result. enforce: false keeps FAIL cases from failing their own call so this
-# run reports only whether every case produced its EXPECTED result.
+# Acceptance test for the three-gate Engineering CI: runs the unchanged engineering-ci.yml (copied from
+# GeoRobert630/vibe-code-engineering tools/engineering-ci/examples/github-actions-engineering-ci.yml at commit
+# 62461a66e617fc7b5d7adda174d2d64ec217933d) once per case directory with the real pinned tools, then asserts every
+# gate, the final result, the separate reports / SARIF / namespaces and the coverage statuses.
+# enforce: false keeps FAIL cases from failing their own call, so this run reports only whether every case produced
+# its EXPECTED result; clean-enforced checks that enforcement (default enforce: true) does not fail a PASS.
 #
-#   case   project             security gate   quality gate   overall
-#   A      cases/a-clean       PASS            PASS           PASS
-#   B      cases/b-security    FAIL            PASS           FAIL   (existing intentional Phase 2 SQL-injection fixture)
-#   C      cases/c-quality     PASS            FAIL           FAIL   (existing inaccessible Quality CI fixture)
-#   D      cases/d-both        FAIL            FAIL           FAIL
+#   case            project              pages            security  accessibility  performance  final
+#   clean           cases/clean          /                PASS      PASS           PASS         PASS
+#   vulnerable      cases/vulnerable     /                FAIL      PASS           PASS         FAIL  (Phase 2 SQL-injection fixture)
+#   inaccessible    cases/inaccessible   /                PASS      FAIL           PASS         FAIL  (inaccessible Quality CI fixture)
+#   slow            cases/slow           /slow.html       PASS      PASS           FAIL         FAIL  (Quality CI performance SLOW fixture)
+#   all-fail        cases/all-fail       / /slow.html     FAIL      FAIL           FAIL         FAIL
+#   clean-enforced  cases/clean          /                PASS      PASS           PASS         PASS  (enforce: true)
 #
 # Every case: no runtime target, so Authentication / Session / Authorization must be NOT VERIFIED.
 # No credentials or secrets are used.
@@ -23,49 +27,60 @@ permissions:
   contents: read
   security-events: write
 
+env:
+  ENGINEERING_CI_REF: 62461a66e617fc7b5d7adda174d2d64ec217933d
+
 jobs:
-  case-a:
+  clean:
     uses: ./.github/workflows/engineering-ci.yml
-    with: {project_path: cases/a-clean, quality_site_dir: site, artifact_suffix: -case-a, enforce: false}
-  case-b:
+    with: {project_path: cases/clean, quality_site_dir: site, artifact_suffix: -clean, enforce: false}
+  vulnerable:
     uses: ./.github/workflows/engineering-ci.yml
-    with: {project_path: cases/b-security, quality_site_dir: site, artifact_suffix: -case-b, enforce: false}
-  case-c:
+    with: {project_path: cases/vulnerable, quality_site_dir: site, artifact_suffix: -vulnerable, enforce: false}
+  inaccessible:
     uses: ./.github/workflows/engineering-ci.yml
-    with: {project_path: cases/c-quality, quality_site_dir: site, artifact_suffix: -case-c, enforce: false}
-  case-d:
+    with: {project_path: cases/inaccessible, quality_site_dir: site, artifact_suffix: -inaccessible, enforce: false}
+  slow:
     uses: ./.github/workflows/engineering-ci.yml
-    with: {project_path: cases/d-both, quality_site_dir: site, artifact_suffix: -case-d, enforce: false}
+    with: {project_path: cases/slow, quality_site_dir: site, quality_pages: "/slow.html", artifact_suffix: -slow, enforce: false}
+  all-fail:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/all-fail, quality_site_dir: site, quality_pages: "/ /slow.html", artifact_suffix: -all-fail, enforce: false}
+  clean-enforced:
+    uses: ./.github/workflows/engineering-ci.yml
+    with: {project_path: cases/clean, quality_site_dir: site, artifact_suffix: -clean-enforced}
 
   assert:
     name: Assert expected results
-    needs: [case-a, case-b, case-c, case-d]
+    needs: [clean, vulnerable, inaccessible, slow, all-fail, clean-enforced]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: project
+          persist-credentials: false
+
+      - name: Checkout Engineering CI (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: GeoRobert630/vibe-code-engineering
+          ref: ${{ env.ENGINEERING_CI_REF }}
+          path: engineering-ci
+          persist-credentials: false
+
+      - name: Workflow copy is unchanged from the pinned Engineering CI commit
+        run: diff -u engineering-ci/tools/engineering-ci/examples/github-actions-engineering-ci.yml project/.github/workflows/engineering-ci.yml
+
+      - name: Download case reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Compare with expectations
         env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os, sys
-          needs = json.loads(os.environ["RESULTS"])
-          expected = {
-              "case-a": ("PASS", "PASS", "PASS"),
-              "case-b": ("FAIL", "PASS", "FAIL"),
-              "case-c": ("PASS", "FAIL", "FAIL"),
-              "case-d": ("FAIL", "FAIL", "FAIL"),
-          }
-          bad = 0
-          print("| case | security | quality | overall | auth / session / authz | expected | ok |")
-          print("|---|---|---|---|---|---|---|")
-          for case, (sec, qual, overall) in expected.items():
-              o = needs.get(case, {}).get("outputs", {})
-              got = (o.get("security_status"), o.get("quality_status"), o.get("overall"))
-              gates = (o.get("security_gate"), o.get("quality_gate"))
-              cov = (o.get("authentication"), o.get("session"), o.get("authorization"))
-              ok = got == (sec, qual, overall) and gates == (sec, qual) and cov == ("NOT VERIFIED",) * 3
-              bad += not ok
-              print(f"| {case} | {got[0]} | {got[1]} | {got[2]} | {' / '.join(map(str, cov))} | {sec}/{qual}/{overall} | {'yes' if ok else 'NO'} |")
-          sys.exit(1 if bad else 0)
-          PY
+          NEEDS: ${{ toJSON(needs) }}
+          ARTIFACTS_DIR: artifacts
+          CHECK_CODE_SCANNING: "true"
+          GH_TOKEN: ${{ github.token }}
+        run: python3 project/.github/acceptance/assert_cases.py
